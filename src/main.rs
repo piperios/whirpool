@@ -1,5 +1,6 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::io::Write;
 use std::time::SystemTime;
 
@@ -23,6 +24,18 @@ pub enum MessageFields {
     GenerateOk {
         id: MsgId,
     },
+    Broadcast {
+        message: MsgId,
+    },
+    BroadcastOk,
+    Read,
+    ReadOk {
+        messages: Vec<MsgId>,
+    },
+    Topology {
+        topology: HashMap<String, Vec<String>>,
+    },
+    TopologyOk,
     Error {
         code: usize,
         text: String,
@@ -48,6 +61,8 @@ pub struct Message {
 
 pub struct StateMachine {
     id: MsgId,
+    seen_msgs: Vec<MsgId>,
+    topology: HashMap<String, Vec<String>>,
 }
 
 impl StateMachine {
@@ -91,6 +106,41 @@ impl StateMachine {
                     },
                 },
             },
+            MessageFields::Broadcast { message } => {
+                self.seen_msgs.push(*message);
+                Message {
+                    src: msg.dest,
+                    dest: msg.src,
+                    body: MessageBody {
+                        msg_id: self.id.into(),
+                        in_reply_to: msg.body.msg_id,
+                        fields: MessageFields::BroadcastOk,
+                    },
+                }
+            }
+            MessageFields::Read => Message {
+                src: msg.dest,
+                dest: msg.src,
+                body: MessageBody {
+                    msg_id: self.id.into(),
+                    in_reply_to: msg.body.msg_id,
+                    fields: MessageFields::ReadOk {
+                        messages: self.seen_msgs.clone(),
+                    },
+                },
+            },
+            MessageFields::Topology { topology } => {
+                self.topology = topology.to_owned();
+                Message {
+                    src: msg.dest,
+                    dest: msg.src,
+                    body: MessageBody {
+                        msg_id: self.id.into(),
+                        in_reply_to: msg.body.msg_id,
+                        fields: MessageFields::TopologyOk,
+                    },
+                }
+            }
             _ => panic!("Received response message as request!!!"),
         }
     }
@@ -100,7 +150,11 @@ fn main() -> anyhow::Result<()> {
     let stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
 
-    let mut state_machine = StateMachine { id: 0 };
+    let mut state_machine = StateMachine {
+        id: 0,
+        seen_msgs: Vec::new(),
+        topology: HashMap::new(),
+    };
 
     serde_json::Deserializer::from_reader(stdin)
         .into_iter::<Message>()
