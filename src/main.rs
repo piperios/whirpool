@@ -1,8 +1,9 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
+use std::time::SystemTime;
 
-type MsgId = usize;
+type MsgId = u64;
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -17,6 +18,10 @@ pub enum MessageFields {
     },
     EchoOk {
         echo: String,
+    },
+    Generate,
+    GenerateOk {
+        id: MsgId,
     },
     Error {
         code: usize,
@@ -41,10 +46,14 @@ pub struct Message {
     body: MessageBody,
 }
 
-pub struct StateMachine;
+pub struct StateMachine {
+    id: MsgId,
+}
 
 impl StateMachine {
-    pub fn step(&self, msg: Message) -> Message {
+    pub fn step(&mut self, msg: Message) -> Message {
+        self.id += 1;
+
         match &msg.body.fields {
             MessageFields::Init {
                 node_id: _,
@@ -62,9 +71,24 @@ impl StateMachine {
                 src: msg.dest,
                 dest: msg.src,
                 body: MessageBody {
-                    msg_id: msg.body.msg_id,
+                    msg_id: self.id.into(),
                     in_reply_to: msg.body.msg_id,
                     fields: MessageFields::EchoOk { echo: echo.clone() },
+                },
+            },
+            MessageFields::Generate => Message {
+                src: msg.dest,
+                dest: msg.src,
+                body: MessageBody {
+                    msg_id: self.id.into(),
+                    in_reply_to: msg.body.msg_id,
+                    fields: MessageFields::GenerateOk {
+                        id: SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs()
+                            + rand::random::<u64>(),
+                    },
                 },
             },
             _ => panic!("Received response message as request!!!"),
@@ -76,7 +100,7 @@ fn main() -> anyhow::Result<()> {
     let stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
 
-    let state_machine = StateMachine;
+    let mut state_machine = StateMachine { id: 0 };
 
     serde_json::Deserializer::from_reader(stdin)
         .into_iter::<Message>()
