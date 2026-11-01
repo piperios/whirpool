@@ -66,7 +66,7 @@ pub struct StateMachine {
 }
 
 impl StateMachine {
-    pub fn step(&mut self, msg: Message) -> Message {
+    pub fn build_response(&mut self, msg: Message) -> Message {
         self.id += 1;
 
         match &msg.body.fields {
@@ -107,6 +107,8 @@ impl StateMachine {
                 },
             },
             MessageFields::Broadcast { message } => {
+                // TODO (api): Some sort of broadcast-batching mechanism
+
                 self.seen_msgs.push(*message);
                 Message {
                     src: msg.dest,
@@ -159,9 +161,9 @@ fn main() -> anyhow::Result<()> {
     serde_json::Deserializer::from_reader(stdin)
         .into_iter::<Message>()
         .try_for_each(|msg| -> anyhow::Result<()> {
-            let msg = msg.context("Maelstrom input from STDIN could not be deserialized")?;
-            serde_json::to_writer(&mut stdout, &state_machine.step(msg))
-                .context("Failed to serialize response message")?;
+            let msg = msg.context("Failed to deserialize message from stdin")?;
+            serde_json::to_writer(&mut stdout, &state_machine.build_response(msg))
+                .context("Failed to serialize response to stdout")?;
             stdout.write_all(b"\n").context("Failed to write newline")?;
             Ok(())
         })?;
