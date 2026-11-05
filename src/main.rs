@@ -1,7 +1,6 @@
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::io::Write;
+use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
 type MsgId = u64;
@@ -61,40 +60,54 @@ pub struct Message {
 
 pub struct StateMachine {
     id: MsgId,
-    seen_msgs: Vec<MsgId>,
+    seen_msgs: HashSet<MsgId>,
     topology: HashMap<String, Vec<String>>,
 }
 
+pub fn make_message(src: String, dest: String, body: MessageBody) -> Message {
+    Message { src, dest, body }
+}
+
+pub fn send_message(pipe: &mut impl std::io::Write, msg: Message) -> anyhow::Result<()> {
+    serde_json::to_writer(&mut *pipe, &msg).context("Failed to serialize response to stdout")?;
+    pipe.write_all(b"\n").context("Failed to write newline")?;
+    Ok(())
+}
+
 impl StateMachine {
-    pub fn build_response(&mut self, msg: Message) -> Message {
+    pub fn build_response(
+        &mut self,
+        pipe: &mut impl std::io::Write,
+        msg: Message,
+    ) -> anyhow::Result<()> {
         self.id += 1;
 
-        match &msg.body.fields {
+        if let Some(msg) = match &msg.body.fields {
             MessageFields::Init {
                 node_id: _,
                 node_ids: _,
-            } => Message {
-                src: msg.dest,
-                dest: msg.src,
-                body: MessageBody {
+            } => Some(make_message(
+                msg.dest,
+                msg.src,
+                MessageBody {
                     msg_id: None,
                     in_reply_to: msg.body.msg_id,
                     fields: MessageFields::InitOk,
                 },
-            },
-            MessageFields::Echo { echo } => Message {
-                src: msg.dest,
-                dest: msg.src,
-                body: MessageBody {
+            )),
+            MessageFields::Echo { echo } => Some(make_message(
+                msg.dest,
+                msg.src,
+                MessageBody {
                     msg_id: self.id.into(),
                     in_reply_to: msg.body.msg_id,
                     fields: MessageFields::EchoOk { echo: echo.clone() },
                 },
-            },
-            MessageFields::Generate => Message {
-                src: msg.dest,
-                dest: msg.src,
-                body: MessageBody {
+            )),
+            MessageFields::Generate => Some(make_message(
+                msg.dest,
+                msg.src,
+                MessageBody {
                     msg_id: self.id.into(),
                     in_reply_to: msg.body.msg_id,
                     fields: MessageFields::GenerateOk {
@@ -105,46 +118,69 @@ impl StateMachine {
                             + rand::random::<u64>(),
                     },
                 },
-            },
+            )),
             MessageFields::Broadcast { message } => {
-                // TODO (api): Some sort of broadcast-batching mechanism
+                if self.seen_msgs.insert(*message) {
+                    self.topology[&msg.dest]
+                        .iter()
+                        .filter(|n| n.as_str() != msg.src)
+                        .try_for_each(|n| -> anyhow::Result<()> {
+                            send_message(
+                                &mut *pipe,
+                                make_message(
+                                    msg.dest.clone(),
+                                    n.clone(),
+                                    MessageBody {
+                                        msg_id: self.id.into(),
+                                        in_reply_to: None,
+                                        fields: MessageFields::Broadcast { message: *message },
+                                    },
+                                ),
+                            )?;
 
-                self.seen_msgs.push(*message);
-                Message {
-                    src: msg.dest,
-                    dest: msg.src,
-                    body: MessageBody {
+                            Ok(())
+                        })?;
+                }
+
+                Some(make_message(
+                    msg.dest,
+                    msg.src,
+                    MessageBody {
                         msg_id: self.id.into(),
                         in_reply_to: msg.body.msg_id,
                         fields: MessageFields::BroadcastOk,
                     },
-                }
+                ))
             }
-            MessageFields::Read => Message {
-                src: msg.dest,
-                dest: msg.src,
-                body: MessageBody {
+            MessageFields::Read => Some(make_message(
+                msg.dest,
+                msg.src,
+                MessageBody {
                     msg_id: self.id.into(),
                     in_reply_to: msg.body.msg_id,
                     fields: MessageFields::ReadOk {
-                        messages: self.seen_msgs.clone(),
+                        messages: self.seen_msgs.iter().copied().collect(),
                     },
                 },
-            },
+            )),
             MessageFields::Topology { topology } => {
                 self.topology = topology.to_owned();
-                Message {
-                    src: msg.dest,
-                    dest: msg.src,
-                    body: MessageBody {
+                Some(make_message(
+                    msg.dest,
+                    msg.src,
+                    MessageBody {
                         msg_id: self.id.into(),
                         in_reply_to: msg.body.msg_id,
                         fields: MessageFields::TopologyOk,
                     },
-                }
+                ))
             }
-            _ => panic!("Received response message as request!!!"),
+            _ => None,
+        } {
+            send_message(&mut *pipe, msg)?;
         }
+
+        Ok(())
     }
 }
 
@@ -154,7 +190,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut state_machine = StateMachine {
         id: 0,
-        seen_msgs: Vec::new(),
+        seen_msgs: HashSet::new(),
         topology: HashMap::new(),
     };
 
@@ -162,9 +198,7 @@ fn main() -> anyhow::Result<()> {
         .into_iter::<Message>()
         .try_for_each(|msg| -> anyhow::Result<()> {
             let msg = msg.context("Failed to deserialize message from stdin")?;
-            serde_json::to_writer(&mut stdout, &state_machine.build_response(msg))
-                .context("Failed to serialize response to stdout")?;
-            stdout.write_all(b"\n").context("Failed to write newline")?;
+            state_machine.build_response(&mut stdout, msg)?;
             Ok(())
         })?;
 
