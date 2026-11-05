@@ -121,23 +121,28 @@ impl StateMachine {
             )),
             MessageFields::Broadcast { message } => {
                 if self.seen_msgs.insert(*message) {
-                    self.topology[&msg.dest]
-                        .iter()
-                        .filter(|n| n.as_str() != msg.src)
-                        .try_for_each(|n| -> anyhow::Result<()> {
-                            send_message(
-                                &mut *pipe,
-                                make_message(
-                                    msg.dest.clone(),
-                                    n.clone(),
-                                    MessageBody {
-                                        msg_id: self.id.into(),
-                                        in_reply_to: None,
-                                        fields: MessageFields::Broadcast { message: *message },
-                                    },
-                                ),
+                    self.topology
+                        .values()
+                        .try_for_each(|v| -> anyhow::Result<()> {
+                            v.iter().filter(|n| n.as_str() != msg.src).try_for_each(
+                                |n| -> anyhow::Result<()> {
+                                    send_message(
+                                        &mut *pipe,
+                                        make_message(
+                                            msg.dest.clone(),
+                                            n.clone(),
+                                            MessageBody {
+                                                msg_id: self.id.into(),
+                                                in_reply_to: None,
+                                                fields: MessageFields::Broadcast {
+                                                    message: *message,
+                                                },
+                                            },
+                                        ),
+                                    )?;
+                                    Ok(())
+                                },
                             )?;
-
                             Ok(())
                         })?;
                 }
