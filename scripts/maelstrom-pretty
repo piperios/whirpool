@@ -1,0 +1,663 @@
+#!/usr/bin/env python3
+"""Reformat Maelstrom/Jepsen log output into something readable.
+
+Usage:
+    ./maelstrom test ... | scripts/maelstrom-pretty
+    scripts/maelstrom-pretty < store/latest/jepsen.log
+
+Accepts both the console format (`LEVEL [YYYY-MM-DD HH:MM:SS,mmm] thread - logger msg`)
+and the jepsen.log format (`YYYY-MM-DD HH:MM:SS,mmm{GMT}\\tLEVEL\\t[thread] logger: msg`).
+
+Colour is used when stdout is a terminal; set NO_COLOR to disable or
+FORCE_COLOR to enable (e.g. when piping into `less -R`).
+"""
+
+import io
+import os
+import re
+import sys
+from collections.abc import Callable
+from typing import NamedTuple
+
+LEVELS = r"(?P<level>TRACE|DEBUG|INFO|WARN|ERROR|FATAL)"
+TIMESTAMP = r"\d{4}-\d\d-\d\d (?P<time>\d\d:\d\d:\d\d),(?P<ms>\d{3})"
+CONSOLE_HEADER = re.compile(
+    rf"^{LEVELS} \[{TIMESTAMP}\] (?P<thread>.+?) - (?P<logger>\S+)(?: (?P<msg>.*))?$"
+)
+FILE_HEADER = re.compile(
+    rf"^{TIMESTAMP}\{{GMT\}}\t{LEVELS}\t\[(?P<thread>[^\]]*)\] (?P<logger>[^:]+): ?(?P<msg>.*)$"
+)
+# Messages whose multi-line EDN follow-up is configuration noise, collapsed to one line.
+ELIDED_MAPS = frozenset({"Test options:", "Running test:"})
+VERDICT = re.compile(r"^(Everything looks good!|Analysis invalid!|Errors occurred)")
+
+
+# ---------------------------------------------------------------- colour
+
+type Style = Callable[[str], str]
+
+
+def _colour_enabled() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    return bool(os.environ.get("FORCE_COLOR")) or sys.stdout.isatty()
+
+
+COLOUR = _colour_enabled()
+
+
+def _plain(s: str) -> str:
+    return s
+
+
+def _sgr(code: str) -> Style:
+    if not COLOUR:
+        return _plain
+    return lambda s: f"\x1b[{code}m{s}\x1b[0m"
+
+
+dim, bold, red, green, yellow, blue, magenta, cyan = (
+    _sgr(c) for c in ("2", "1", "31", "32", "33", "34", "35", "36")
+)
+NODE_COLOURS: tuple[Style, ...] = (cyan, magenta, blue, yellow, green)
+
+
+def node_colour(name: str) -> Style:
+    digits = re.sub(r"\D", "", name)
+    return NODE_COLOURS[int(digits) % len(NODE_COLOURS)] if digits else cyan
+
+
+def out(line: str = "") -> None:
+    sys.stdout.write(line + "\n")
+
+
+# ---------------------------------------------------------------- EDN
+
+class Keyword(str):
+    pass
+
+
+class Symbol(str):
+    pass
+
+
+class Tagged:
+    def __init__(self, tag: str, value: "Edn") -> None:
+        self.tag = tag
+        self.value = value
+
+
+class EdnSet(list["Edn"]):
+    pass
+
+
+type EdnKey = str | int | float | bool | None
+type Edn = EdnKey | list[Edn] | dict[EdnKey, Edn] | Tagged
+type EdnMap = dict[EdnKey, Edn]
+
+EDN_DELIMS = frozenset("()[]{}\" \t\n\r,;")
+STRING_ESCAPES = {"n": "\n", "t": "\t"}
+
+
+def parse_edn(text: str) -> Edn:
+    """Parse one EDN form (Clojure printer output) from text. Raises ValueError."""
+    pos = 0
+    n = len(text)
+
+    def skip_ws() -> None:
+        nonlocal pos
+        while pos < n:
+            c = text[pos]
+            if c in " \t\n\r,":
+                pos += 1
+            elif c == ";":
+                while pos < n and text[pos] != "\n":
+                    pos += 1
+            else:
+                return
+
+    def atom() -> str:
+        nonlocal pos
+        start = pos
+        while pos < n and text[pos] not in EDN_DELIMS:
+            pos += 1
+        return text[start:pos]
+
+    def seq(close: str) -> list[Edn]:
+        nonlocal pos
+        items: list[Edn] = []
+        while True:
+            skip_ws()
+            if pos >= n:
+                raise ValueError("unterminated collection")
+            if text[pos] == close:
+                pos += 1
+                return items
+            items.append(form())
+
+    def string() -> str:
+        nonlocal pos
+        buf: list[str] = []
+        while pos < n and text[pos] != '"':
+            if text[pos] == "\\":
+                pos += 1
+                if pos >= n:
+                    break
+                buf.append(STRING_ESCAPES.get(text[pos], text[pos]))
+            else:
+                buf.append(text[pos])
+            pos += 1
+        if pos >= n:
+            raise ValueError("unterminated string")
+        pos += 1
+        return "".join(buf)
+
+    def scalar(tok: str) -> Edn:
+        if tok.startswith(":"):
+            return Keyword(tok[1:])
+        if tok == "nil":
+            return None
+        if tok in ("true", "false"):
+            return tok == "true"
+        try:
+            return int(tok.rstrip("N"))
+        except ValueError:
+            pass
+        try:
+            return float(tok.rstrip("M"))
+        except ValueError:
+            return Symbol(tok)
+
+    def form() -> Edn:
+        nonlocal pos
+        skip_ws()
+        if pos >= n:
+            raise ValueError("unexpected end of input")
+        c = text[pos]
+        if c == "{":
+            pos += 1
+            items = seq("}")
+            if len(items) % 2:
+                raise ValueError("odd number of map entries")
+            return {_hashable(k): v for k, v in zip(items[::2], items[1::2], strict=True)}
+        if c in "[(":
+            pos += 1
+            return seq("]" if c == "[" else ")")
+        if c == '"':
+            pos += 1
+            return string()
+        if c == "#":
+            pos += 1
+            if pos < n and text[pos] == "{":
+                pos += 1
+                return EdnSet(seq("}"))
+            tag = atom()
+            return Tagged(tag, form())
+        if c == "\\":
+            pos += 1
+            if pos >= n:
+                raise ValueError("dangling character literal")
+            return Symbol("\\" + text[pos] + atom())
+        if c in ")]}":
+            raise ValueError(f"unexpected {c!r}")
+        return scalar(atom())
+
+    value = form()
+    skip_ws()
+    if pos != n:
+        raise ValueError("trailing data after form")
+    return value
+
+
+def _hashable(k: Edn) -> EdnKey:
+    if isinstance(k, (list, dict, Tagged)):
+        return Symbol(fmt(k))
+    return k
+
+
+def bracket_delta(line: str) -> int:
+    """Net open-bracket count of a line, ignoring strings and char literals."""
+    depth = 0
+    in_str = False
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if in_str:
+            if c == "\\":
+                i += 1
+            elif c == '"':
+                in_str = False
+        elif c == '"':
+            in_str = True
+        elif c == "\\":
+            i += 1
+        elif c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        i += 1
+    return depth
+
+
+# ---------------------------------------------------------------- value formatting
+
+def op_fields(v: Edn) -> EdnMap | None:
+    """The field map of a `#jepsen.history.Op{...}` record, or None if v isn't one."""
+    if isinstance(v, Tagged) and v.tag == "jepsen.history.Op" and isinstance(v.value, dict):
+        return v.value
+    return None
+
+
+def fmt_op(m: EdnMap) -> str:
+    parts = [f"#{m.get('index')}"]
+    time = m.get("time")
+    if isinstance(time, int):
+        parts.append(f"t={time / 1e9:.3f}s")
+    parts += [f"p{m.get('process')}", fmt(m.get("type")), fmt(m.get("f")), fmt(m.get("value"))]
+    if m.get("final?"):
+        parts.append("final")
+    return "op[" + " ".join(parts) + "]"
+
+
+def fmt(v: Edn) -> str:
+    """Single-line rendering of an EDN value."""
+    if v is None:
+        return "nil"
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if isinstance(v, (Keyword, Symbol)):
+        return str(v)
+    if isinstance(v, str):
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    if isinstance(v, float):
+        return f"{v:g}"
+    if isinstance(v, EdnSet):
+        return "#{" + " ".join(fmt(x) for x in v) + "}"
+    if isinstance(v, list):
+        return "[" + " ".join(fmt(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{" + ", ".join(f"{fmt(k)}: {fmt(x)}" for k, x in v.items()) + "}"
+    if isinstance(v, Tagged):
+        op = op_fields(v)
+        if op is not None:
+            return fmt_op(op)
+        if v.tag == "object" and isinstance(v.value, list) and v.value:
+            return f"<{fmt(v.value[0])}>"
+        return f"#{v.tag} {fmt(v.value)}"
+    return str(v)
+
+
+def fmt_validity(v: Edn) -> str:
+    if v is True:
+        return green("✓")
+    if v is False:
+        return red("✗")
+    return yellow("?")
+
+
+def is_scalar(v: Edn) -> bool:
+    if isinstance(v, (dict, Tagged)):
+        return op_fields(v) is not None
+    if isinstance(v, list):
+        return all(not isinstance(x, (dict, list, Tagged)) for x in v)
+    return True
+
+
+def table_rows(v: Edn) -> list[EdnMap] | None:
+    """v as table rows if it is a non-empty list of maps with scalar values."""
+    if not isinstance(v, list) or not v:
+        return None
+    rows: list[EdnMap] = []
+    for x in v:
+        if not isinstance(x, dict) or not all(map(is_scalar, x.values())):
+            return None
+        rows.append(x)
+    return rows
+
+
+def render_table(rows: list[EdnMap], indent: int) -> None:
+    cols = list(dict.fromkeys(k for row in rows for k in row))
+    cells = [[fmt(row[c]) if c in row else "" for c in cols] for row in rows]
+    widths = [max(len(str(c)), *(len(r[i]) for r in cells)) for i, c in enumerate(cols)]
+    pad = " " * indent
+    out(pad + dim("  ".join(str(c).ljust(w) for c, w in zip(cols, widths, strict=True)).rstrip()))
+    for r in cells:
+        out(pad + "  ".join(x.ljust(w) for x, w in zip(r, widths, strict=True)).rstrip())
+
+
+def render_tree(m: EdnMap, indent: int) -> None:
+    """Multi-line rendering of a map: scalars inline, nested maps indented."""
+    pad = " " * indent
+    width = max((len(str(k)) for k in m), default=0)
+    for k, v in m.items():
+        if k == "valid?":
+            continue
+        key = str(k).ljust(width)
+        rows = table_rows(v)
+        if isinstance(v, dict) and v and "valid?" not in v and all(map(is_scalar, v.values())) \
+                and len(fmt(v)) <= 80:
+            out(f"{pad}{key}  {fmt(v)}")
+        elif isinstance(v, dict) and v:
+            mark = f" {fmt_validity(v['valid?'])}" if "valid?" in v else ""
+            out(f"{pad}{bold(str(k))}{mark}")
+            render_tree(v, indent + 2)
+        elif rows is not None:
+            out(f"{pad}{key}  {dim(f'({len(rows)})')}")
+            render_table(rows, indent + 2)
+        elif isinstance(v, list) and v and not is_scalar(v):
+            out(f"{pad}{key}  ({len(v)})")
+            for item in v:
+                if isinstance(item, dict):
+                    out(f"{pad}  -")
+                    render_tree(item, indent + 4)
+                else:
+                    out(f"{pad}  - {fmt(item)}")
+        else:
+            count = f"  {dim(f'({len(v)})')}" if isinstance(v, list) and len(v) > 3 else ""
+            out(f"{pad}{key}  {fmt(v)}{count}")
+
+
+def get_in(m: Edn, *path: str) -> Edn:
+    for k in path:
+        if not isinstance(m, dict) or k not in m:
+            return None
+        m = m[k]
+    return m
+
+
+def fmt_quantile(q: EdnKey) -> str:
+    return fmt(q * 100) if isinstance(q, (int, float)) else fmt(q)
+
+
+def render_results(res: EdnMap) -> None:
+    valid = res.get("valid?")
+    if valid is True:
+        title = green("VALID")
+    elif valid is False:
+        title = red("INVALID")
+    else:
+        title = yellow(f"VALID? {fmt(valid)}")
+    out()
+    out(bold("━━ results ━━ ") + bold(title))
+
+    stats = res.get("stats")
+    if isinstance(stats, dict):
+        fails, infos = stats.get("fail-count"), stats.get("info-count")
+        out(f"  ops {stats.get('count')}: {stats.get('ok-count')} ok, "
+            f"{(red if fails else _plain)(f'{fails} fail')}, "
+            f"{(yellow if infos else _plain)(f'{infos} info')}")
+    servers = get_in(res, "net", "servers")
+    if isinstance(servers, dict) and "msgs-per-op" in servers:
+        out(f"  server msgs/op {fmt(servers['msgs-per-op'])}  (server msgs {servers.get('msg-count')})")
+    for name in ("stable-latencies", "lost-latencies"):
+        lat = get_in(res, "workload", name)
+        if isinstance(lat, dict) and lat:
+            qs = "  ".join(f"p{fmt_quantile(q)}={v}ms" for q, v in lat.items())
+            out(f"  {name}  {qs}")
+
+    passed: list[str] = []
+    for k, v in res.items():
+        if k == "valid?":
+            continue
+        if isinstance(v, dict) and v.get("valid?") is True:
+            passed.append(str(k))
+            continue
+        out()
+        if isinstance(v, dict):
+            out(f"  {fmt_validity(v.get('valid?'))} {bold(str(k))}")
+            render_tree(v, 6)
+        else:
+            out(f"  {bold(str(k))}  {fmt(v)}")
+    if passed:
+        out()
+        out("  " + "  ".join(f"{green('✓')} {k}" for k in passed))
+    out()
+
+
+# ---------------------------------------------------------------- record handling
+
+def match_header(line: str) -> re.Match[str] | None:
+    return CONSOLE_HEADER.match(line) or FILE_HEADER.match(line)
+
+
+def thread_label(thread: str) -> str:
+    node_io = re.fullmatch(r"(n\d+) std(?:in|out|err)", thread)
+    if node_io:
+        return node_io.group(1)
+    fixed = {"jepsen test runner": "runner", "jepsen results": "results", "jepsen worker nemesis": "nemesis"}
+    if thread in fixed:
+        return fixed[thread]
+    for prefix, short in (("jepsen worker ", "w"), ("jepsen node ", "")):
+        if thread.startswith(prefix):
+            return short + thread[len(prefix):]
+    return thread.removeprefix("jepsen ")
+
+
+def fmt_call(f: str, value: str) -> str:
+    name = f.removeprefix(":")
+    return bold(name) if value in ("", "nil") else f"{bold(name)} {value}"
+
+
+STATUS: dict[str, str] = {
+    ":ok": green("ok  "),
+    ":fail": red("fail"),
+    ":info": yellow("info"),
+}
+
+
+class PendingOp(NamedTuple):
+    time_ms: int
+    f: str
+    value: str
+    prefix: str
+
+
+class Formatter:
+    def __init__(self) -> None:
+        self.pending: dict[str, PendingOp] = {}  # by jepsen process id
+        self.edn_lines: list[str] | None = None  # buffered lines of a multi-line EDN form
+        self.edn_depth = 0
+        self.edn_elide = False
+        self.expect_edn = False  # previous header ended with ':' so the next line may open EDN
+        self.last_msg = ""
+        self.frames = 0  # consecutive elided stack frames
+        self.prefix_width = len("HH:MM:SS.mmm ") + len("label   ")
+        self.blank = False
+
+    # -- generic emit helpers
+
+    def prefix(self, time: str, ms: str, thread: str, level: str) -> str:
+        parts = [dim(f"{time}.{ms}")]
+        label = thread_label(thread)
+        colour = node_colour(label) if re.fullmatch(r"n\d+", label) else _plain
+        parts.append(colour(label.ljust(7)))
+        if level in ("WARN", "ERROR", "FATAL"):
+            parts.append((yellow if level == "WARN" else red)(bold(level)))
+        return " ".join(parts)
+
+    def flush_frames(self) -> None:
+        if self.frames:
+            noun = "frame" if self.frames == 1 else "frames"
+            out(" " * self.prefix_width + dim(f"  … {self.frames} stack {noun} elided"))
+            self.frames = 0
+
+    def flush_pending(self) -> None:
+        for op in self.pending.values():
+            out(f"{op.prefix}{dim('????')} {fmt_call(op.f, op.value)}  {dim('(no response)')}")
+        self.pending.clear()
+
+    # -- entry points
+
+    def feed(self, raw: str) -> None:
+        line = raw.rstrip("\n")
+        m = match_header(line)
+
+        if self.edn_lines is not None:
+            if m:
+                self.flush_edn(parse=False)
+            else:
+                self.edn_lines.append(line)
+                self.edn_depth += bracket_delta(line)
+                if self.edn_depth <= 0:
+                    self.flush_edn()
+                return
+
+        if m:
+            self.flush_frames()
+            self.blank = False
+            self.header(m)
+        else:
+            self.continuation(line)
+
+    def finish(self) -> None:
+        if self.edn_lines is not None:
+            self.flush_edn()
+        self.flush_frames()
+        self.flush_pending()
+
+    # -- header lines
+
+    def header(self, m: re.Match[str]) -> None:
+        time, ms, level, thread, logger = m.group("time", "ms", "level", "thread", "logger")
+        msg: str = m.group("msg") or ""
+        pfx = self.prefix(time, ms, thread, level) + " "
+        self.expect_edn = msg.endswith(":")
+        self.last_msg = msg
+
+        if msg == "Run complete, writing":
+            self.flush_pending()
+
+        if logger == "jepsen.util" and "\t" in msg:
+            self.op(pfx, time, ms, msg)
+        elif thread.endswith(" stderr"):
+            node = thread.split()[0]
+            colour = node_colour(node)
+            out(f"{dim(f'{time}.{ms}')} {colour(node.ljust(7))} {colour('│')} {msg}")
+        elif msg.startswith((":send ", ":recv ")):
+            self.net_message(pfx, msg)
+        elif msg.startswith("{"):
+            self.start_edn(msg, elide=False)
+        elif level in ("WARN", "ERROR", "FATAL"):
+            out(pfx + bold(msg))
+        else:
+            out(pfx + dim(msg))
+
+    def op(self, pfx: str, time: str, ms: str, msg: str) -> None:
+        proc, typ, f, value, *rest = msg.split("\t") + [""] * 3
+        t = (int(time[:2]) * 3600 + int(time[3:5]) * 60 + int(time[6:8])) * 1000 + int(ms)
+        if typ == ":invoke":
+            self.pending[proc] = PendingOp(t, f, value, pfx)
+            return
+        inv = self.pending.pop(proc, None)
+        latency = ""
+        if inv:
+            pfx = inv.prefix
+            call = fmt_call(inv.f, inv.value)
+            if value not in ("", "nil", inv.value):
+                call += " → " + value
+            latency = "  " + dim(f"{t - inv.time_ms}ms")
+        else:
+            call = fmt_call(f, value)
+        err = " ".join(r for r in rest if r)
+        status = STATUS.get(typ, typ)
+        out(f"{pfx}{status} {call}{latency}{'  ' + red(err) if err else ''}")
+
+    def net_message(self, pfx: str, msg: str) -> None:
+        kind, payload = msg.split(" ", 1)
+        try:
+            parsed = parse_edn(payload)
+        except ValueError:
+            parsed = None
+        m = parsed.value if isinstance(parsed, Tagged) else None
+        if not isinstance(m, dict):
+            out(pfx + msg)
+            return
+        raw_body = m.get("body")
+        body = dict(raw_body) if isinstance(raw_body, dict) else {}
+        typ = body.pop("type", "?")
+        src, dest = str(m.get("src")), str(m.get("dest"))
+        rest = " ".join(f"{k}={fmt(v)}" for k, v in body.items())
+        out(f"{pfx}{dim(kind[1:])} {node_colour(src)(src)} → {node_colour(dest)(dest)}  {bold(str(typ))} {rest}")
+
+    # -- continuation lines (no header)
+
+    def continuation(self, line: str) -> None:
+        stripped = line.strip()
+        if self.expect_edn and stripped.startswith("{"):
+            self.expect_edn = False
+            self.start_edn(line, elide=self.last_msg in ELIDED_MAPS)
+            return
+        self.expect_edn = False
+
+        if line[:1] == "\t" and (stripped.startswith("at ") or re.fullmatch(r"\.\.\. \d+ more", stripped)):
+            self.frames += 1
+            return
+        self.flush_frames()
+
+        if not stripped:
+            if not self.blank:
+                out()
+            self.blank = True
+            return
+        self.blank = False
+
+        v = VERDICT.match(stripped)
+        if v:
+            self.flush_pending()
+            colour = {"Everything looks good!": green, "Analysis invalid!": red}.get(v.group(1), yellow)
+            out(bold(colour(stripped)))
+        else:
+            out(" " * self.prefix_width + line)
+
+    # -- multi-line EDN
+
+    def start_edn(self, first: str, elide: bool) -> None:
+        self.edn_lines = [first]
+        self.edn_depth = bracket_delta(first)
+        self.edn_elide = elide
+        if self.edn_depth <= 0:
+            self.flush_edn()
+
+    def flush_edn(self, parse: bool = True) -> None:
+        """Emit the buffered EDN form; parse=False prints it raw (e.g. it was cut off by a new record)."""
+        lines = self.edn_lines or []
+        self.edn_lines = None
+        parsed: Edn = None
+        if parse:
+            try:
+                parsed = parse_edn("\n".join(lines))
+            except ValueError:
+                parse = False
+        indent = " " * self.prefix_width
+        if not parse:
+            for line in lines:
+                out(indent + line)
+        elif self.edn_elide:
+            out(indent + dim(f"({len(lines)}-line config map elided)"))
+        elif isinstance(parsed, dict) and "valid?" in parsed:
+            render_results(parsed)
+        elif isinstance(parsed, dict):
+            render_tree(parsed, self.prefix_width)
+        else:
+            for line in lines:
+                out(indent + line)
+
+
+def main() -> None:
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(line_buffering=True)
+    fmtr = Formatter()
+    try:
+        for line in iter(sys.stdin.readline, ""):
+            fmtr.feed(line)
+        fmtr.finish()
+    except KeyboardInterrupt:
+        fmtr.finish()
+    except BrokenPipeError:
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+
+
+if __name__ == "__main__":
+    main()
