@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 pub type MsgId = u64;
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct MessageBody<T> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub msg_id: Option<MsgId>,
@@ -13,7 +13,7 @@ pub struct MessageBody<T> {
     pub fields: T,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Message<T> {
     pub src: String,
     pub dest: String,

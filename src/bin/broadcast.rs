@@ -29,9 +29,11 @@ pub enum MessageFields {
 }
 
 pub struct BroadcastNode {
-    id: MsgId,
-    seen_msgs: HashSet<MsgId>,
+    msg_id: MsgId,
+    seen_msgs: HashMap<String, HashSet<MsgId>>,
     topology: HashMap<String, Vec<String>>,
+    node_id: String,
+    nodes: Vec<String>,
 }
 
 impl BroadcastNode {
@@ -40,45 +42,54 @@ impl BroadcastNode {
         pipe: &mut impl std::io::Write,
         msg: Message<MessageFields>,
     ) -> anyhow::Result<()> {
-        self.id += 1;
+        self.msg_id += 1;
 
         if let Some(msg) = match &msg.body.fields {
-            MessageFields::Init {
-                node_id: _,
-                node_ids: _,
-            } => Some(make_message(
-                msg.dest,
-                msg.src,
-                MessageBody {
-                    msg_id: None,
-                    in_reply_to: msg.body.msg_id,
-                    fields: MessageFields::InitOk,
-                },
-            )),
+            MessageFields::Init { node_id, node_ids } => {
+                self.nodes = node_ids.clone();
+                self.node_id = node_id.clone();
+                self.seen_msgs.insert(node_id.clone(), HashSet::new());
+
+                Some(make_message(
+                    msg.dest,
+                    msg.src,
+                    MessageBody {
+                        msg_id: None,
+                        in_reply_to: msg.body.msg_id,
+                        fields: MessageFields::InitOk,
+                    },
+                ))
+            }
             MessageFields::Broadcast { message } => {
-                if self.seen_msgs.insert(*message) {
+                if self
+                    .seen_msgs
+                    .get_mut(&self.node_id)
+                    .unwrap()
+                    .insert(*message)
+                {
                     self.topology
-                        .values()
-                        .try_for_each(|v| -> anyhow::Result<()> {
-                            v.iter().filter(|n| n.as_str() != msg.src).try_for_each(
-                                |n| -> anyhow::Result<()> {
-                                    send_message(
-                                        &mut *pipe,
-                                        make_message(
-                                            msg.dest.clone(),
-                                            n.clone(),
-                                            MessageBody {
-                                                msg_id: self.id.into(),
-                                                in_reply_to: None,
-                                                fields: MessageFields::Broadcast {
-                                                    message: *message,
-                                                },
-                                            },
-                                        ),
-                                    )?;
-                                    Ok(())
-                                },
+                        .get(&self.node_id)
+                        .into_iter()
+                        .flatten()
+                        .try_for_each(|n| -> anyhow::Result<()> {
+                            let dest = n.clone();
+                            if *dest == msg.src {
+                                return Ok(());
+                            }
+
+                            send_message(
+                                &mut *pipe,
+                                make_message(
+                                    msg.dest.clone(),
+                                    dest.clone(),
+                                    MessageBody {
+                                        msg_id: self.msg_id.into(),
+                                        in_reply_to: None,
+                                        fields: MessageFields::Broadcast { message: *message },
+                                    },
+                                ),
                             )?;
+
                             Ok(())
                         })?;
                 }
@@ -87,7 +98,7 @@ impl BroadcastNode {
                     msg.dest,
                     msg.src,
                     MessageBody {
-                        msg_id: self.id.into(),
+                        msg_id: self.msg_id.into(),
                         in_reply_to: msg.body.msg_id,
                         fields: MessageFields::BroadcastOk,
                     },
@@ -97,20 +108,23 @@ impl BroadcastNode {
                 msg.dest,
                 msg.src,
                 MessageBody {
-                    msg_id: self.id.into(),
+                    msg_id: self.msg_id.into(),
                     in_reply_to: msg.body.msg_id,
                     fields: MessageFields::ReadOk {
-                        messages: self.seen_msgs.iter().copied().collect(),
+                        messages: self.seen_msgs[&self.node_id].iter().copied().collect(),
                     },
                 },
             )),
             MessageFields::Topology { topology } => {
-                self.topology = topology.to_owned();
+                topology.iter().for_each(|(k, v)| {
+                    self.topology.insert(k.clone(), v.clone());
+                });
+
                 Some(make_message(
                     msg.dest,
                     msg.src,
                     MessageBody {
-                        msg_id: self.id.into(),
+                        msg_id: self.msg_id.into(),
                         in_reply_to: msg.body.msg_id,
                         fields: MessageFields::TopologyOk,
                     },
@@ -127,9 +141,11 @@ impl BroadcastNode {
 
 fn main() -> anyhow::Result<()> {
     let mut state_machine = BroadcastNode {
-        id: 0,
-        seen_msgs: HashSet::new(),
+        msg_id: 0,
+        node_id: "".to_owned(),
+        seen_msgs: HashMap::new(),
         topology: HashMap::new(),
+        nodes: Vec::new(),
     };
     run(|stdout, msg| state_machine.build_response(stdout, msg))
 }
