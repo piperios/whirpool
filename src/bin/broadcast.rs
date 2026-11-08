@@ -37,7 +37,7 @@ pub struct BroadcastNode {
     topology: HashMap<String, Vec<String>>,
     node_id: String,
     nodes: Vec<String>,
-    last_gossip_ts: std::time::SystemTime,
+    last_gossip_ts: std::time::Instant,
 }
 
 impl BroadcastNode {
@@ -51,7 +51,7 @@ impl BroadcastNode {
     ) -> anyhow::Result<()> {
         self.msg_id += 1;
 
-        if std::time::SystemTime::now().duration_since(self.last_gossip_ts)?
+        if std::time::Instant::now().duration_since(self.last_gossip_ts)
             >= BroadcastNode::GOSSIP_TRANSMISSION_INTERVAL_MS
         {
             let seen_msgs: Vec<_> = self.seen_msgs[&self.node_id].iter().copied().collect();
@@ -84,7 +84,7 @@ impl BroadcastNode {
                     Ok(())
                 })?;
 
-            self.last_gossip_ts = std::time::SystemTime::now();
+            self.last_gossip_ts = std::time::Instant::now();
         }
 
         if let Some(msg) = match &msg.body.fields {
@@ -169,7 +169,7 @@ fn main() -> anyhow::Result<()> {
         seen_msgs: HashMap::new(),
         topology: HashMap::new(),
         nodes: Vec::new(),
-        last_gossip_ts: std::time::SystemTime::now(),
+        last_gossip_ts: std::time::Instant::now(),
     };
     run(|stdout, msg| state_machine.build_response(stdout, msg))
 }

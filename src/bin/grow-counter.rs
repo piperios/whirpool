@@ -31,7 +31,7 @@ pub struct GrowCounterNode {
     counters: std::collections::HashMap<String, usize>,
     node_id: String,
     nodes: Vec<String>,
-    last_gossip_ts: std::time::SystemTime,
+    last_gossip_ts: std::time::Instant,
 }
 
 impl GrowCounterNode {
@@ -45,7 +45,7 @@ impl GrowCounterNode {
     ) -> anyhow::Result<()> {
         self.msg_id += 1;
 
-        if std::time::SystemTime::now().duration_since(self.last_gossip_ts)?
+        if std::time::Instant::now().duration_since(self.last_gossip_ts)
             >= GrowCounterNode::GOSSIP_TRANSMISSION_INTERVAL_MS
         {
             self.nodes.iter().try_for_each(|n| -> anyhow::Result<()> {
@@ -71,7 +71,7 @@ impl GrowCounterNode {
                 Ok(())
             })?;
 
-            self.last_gossip_ts = std::time::SystemTime::now();
+            self.last_gossip_ts = std::time::Instant::now();
         }
 
         if let Some(msg) = match &msg.body.fields {
@@ -141,7 +141,7 @@ fn main() -> anyhow::Result<()> {
         counters: std::collections::HashMap::new(),
         node_id: "".to_owned(),
         nodes: Vec::new(),
-        last_gossip_ts: std::time::SystemTime::now(),
+        last_gossip_ts: std::time::Instant::now(),
     };
     run(|stdout, msg| state_machine.build_response(stdout, msg))
 }
