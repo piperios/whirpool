@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
-use whirpool::{Message, MessageBody, MsgId, make_message, run, send_message};
+use whirpool::{Message, MessageBody, MsgId, run, send_messages};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -21,18 +21,14 @@ pub struct UniqueIdsNode {
 }
 
 impl UniqueIdsNode {
-    pub fn build_response(
-        &mut self,
-        pipe: &mut impl std::io::Write,
-        msg: Message<MessageFields>,
-    ) -> anyhow::Result<()> {
+    pub fn respond(&mut self, msg: Message<MessageFields>) -> Option<Message<MessageFields>> {
         self.id += 1;
 
-        if let Some(msg) = match &msg.body.fields {
+        match &msg.body.fields {
             MessageFields::Init {
                 node_id: _,
                 node_ids: _,
-            } => Some(make_message(
+            } => Some(Message::new(
                 msg.dest,
                 msg.src,
                 MessageBody {
@@ -41,7 +37,7 @@ impl UniqueIdsNode {
                     fields: MessageFields::InitOk,
                 },
             )),
-            MessageFields::Generate => Some(make_message(
+            MessageFields::Generate => Some(Message::new(
                 msg.dest,
                 msg.src,
                 MessageBody {
@@ -57,15 +53,11 @@ impl UniqueIdsNode {
                 },
             )),
             _ => None,
-        } {
-            send_message(&mut *pipe, msg)?;
         }
-
-        Ok(())
     }
 }
 
 fn main() -> anyhow::Result<()> {
     let mut state_machine = UniqueIdsNode { id: 0 };
-    run(|stdout, msg| state_machine.build_response(stdout, msg))
+    run(|stdout, msg| send_messages(stdout, state_machine.respond(msg)))
 }

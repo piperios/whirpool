@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use whirpool::{Message, MessageBody, MsgId, make_message, run, send_message};
+use whirpool::{Message, MessageBody, MsgId, run, send_messages};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -36,7 +36,6 @@ pub struct BroadcastNode {
     seen_msgs: HashMap<String, HashSet<MsgId>>,
     topology: HashMap<String, Vec<String>>,
     node_id: String,
-    nodes: Vec<String>,
     last_gossip_ts: std::time::Instant,
 }
 
@@ -44,31 +43,22 @@ impl BroadcastNode {
     const GOSSIP_TRANSMISSION_INTERVAL_MS: std::time::Duration =
         std::time::Duration::from_millis(50);
 
-    pub fn build_response(
-        &mut self,
-        pipe: &mut impl std::io::Write,
-        msg: Message<MessageFields>,
-    ) -> anyhow::Result<()> {
+    pub fn respond(&mut self, msg: Message<MessageFields>) -> Vec<Message<MessageFields>> {
         self.msg_id += 1;
+
+        let mut out: Vec<Message<MessageFields>> = Vec::new();
 
         if std::time::Instant::now().duration_since(self.last_gossip_ts)
             >= BroadcastNode::GOSSIP_TRANSMISSION_INTERVAL_MS
         {
             let seen_msgs: Vec<_> = self.seen_msgs[&self.node_id].iter().copied().collect();
 
-            self.topology
-                .get(&self.node_id)
-                .into_iter()
-                .flatten()
-                .try_for_each(|n| -> anyhow::Result<()> {
-                    let dest = n.clone();
-                    if *dest == msg.src {
-                        return Ok(());
-                    }
-
-                    send_message(
-                        &mut *pipe,
-                        make_message(
+            if let Some(neighbors) = self.topology.get(&self.node_id) {
+                neighbors
+                    .iter()
+                    .filter(|s| **s != self.node_id)
+                    .for_each(|dest| {
+                        out.push(Message::new(
                             msg.dest.clone(),
                             dest.clone(),
                             MessageBody {
@@ -78,22 +68,19 @@ impl BroadcastNode {
                                     seen: seen_msgs.clone(),
                                 },
                             },
-                        ),
-                    )?;
-
-                    Ok(())
-                })?;
+                        ))
+                    });
+            }
 
             self.last_gossip_ts = std::time::Instant::now();
         }
 
-        if let Some(msg) = match &msg.body.fields {
-            MessageFields::Init { node_id, node_ids } => {
-                self.nodes = node_ids.clone();
+        let reply = match &msg.body.fields {
+            MessageFields::Init { node_id, .. } => {
                 self.node_id = node_id.clone();
                 self.seen_msgs.insert(node_id.clone(), HashSet::new());
 
-                Some(make_message(
+                Some(Message::new(
                     msg.dest,
                     msg.src,
                     MessageBody {
@@ -109,7 +96,7 @@ impl BroadcastNode {
                     .unwrap()
                     .insert(*message);
 
-                Some(make_message(
+                Some(Message::new(
                     msg.dest,
                     msg.src,
                     MessageBody {
@@ -119,7 +106,7 @@ impl BroadcastNode {
                     },
                 ))
             }
-            MessageFields::Read => Some(make_message(
+            MessageFields::Read => Some(Message::new(
                 msg.dest,
                 msg.src,
                 MessageBody {
@@ -135,7 +122,7 @@ impl BroadcastNode {
                     self.topology.insert(k.clone(), v.clone());
                 });
 
-                Some(make_message(
+                Some(Message::new(
                     msg.dest,
                     msg.src,
                     MessageBody {
@@ -154,11 +141,13 @@ impl BroadcastNode {
                 None
             }
             _ => None,
-        } {
-            send_message(&mut *pipe, msg)?;
+        };
+
+        if let Some(reply) = reply {
+            out.push(reply);
         }
 
-        Ok(())
+        out
     }
 }
 
@@ -168,8 +157,7 @@ fn main() -> anyhow::Result<()> {
         node_id: "".to_owned(),
         seen_msgs: HashMap::new(),
         topology: HashMap::new(),
-        nodes: Vec::new(),
         last_gossip_ts: std::time::Instant::now(),
     };
-    run(|stdout, msg| state_machine.build_response(stdout, msg))
+    run(|stdout, msg| send_messages(stdout, state_machine.respond(msg)))
 }

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use whirpool::{Message, MessageBody, MsgId, make_message, run, send_message};
+use whirpool::{Message, MessageBody, MsgId, run, send_messages};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -38,26 +38,21 @@ impl GrowCounterNode {
     const GOSSIP_TRANSMISSION_INTERVAL_MS: std::time::Duration =
         std::time::Duration::from_millis(25);
 
-    pub fn build_response(
-        &mut self,
-        pipe: &mut impl std::io::Write,
-        msg: Message<MessageFields>,
-    ) -> anyhow::Result<()> {
+    pub fn respond(&mut self, msg: Message<MessageFields>) -> Vec<Message<MessageFields>> {
         self.msg_id += 1;
+
+        let mut out: Vec<Message<MessageFields>> = Vec::new();
 
         if std::time::Instant::now().duration_since(self.last_gossip_ts)
             >= GrowCounterNode::GOSSIP_TRANSMISSION_INTERVAL_MS
         {
-            self.nodes.iter().try_for_each(|n| -> anyhow::Result<()> {
-                if n == &self.node_id {
-                    return Ok(());
-                }
-
-                send_message(
-                    &mut *pipe,
-                    make_message(
+            self.nodes
+                .iter()
+                .filter(|s| **s != self.node_id)
+                .for_each(|dest| {
+                    out.push(Message::new(
                         msg.dest.clone(),
-                        n.clone(),
+                        dest.clone(),
                         MessageBody {
                             msg_id: self.msg_id.into(),
                             in_reply_to: None,
@@ -65,16 +60,13 @@ impl GrowCounterNode {
                                 counters: self.counters.clone(),
                             },
                         },
-                    ),
-                )?;
-
-                Ok(())
-            })?;
+                    ))
+                });
 
             self.last_gossip_ts = std::time::Instant::now();
         }
 
-        if let Some(msg) = match &msg.body.fields {
+        let reply = match &msg.body.fields {
             MessageFields::Init { node_id, node_ids } => {
                 self.nodes = node_ids.clone();
                 self.node_id = node_id.clone();
@@ -83,7 +75,7 @@ impl GrowCounterNode {
                     self.counters.insert(n.clone(), 0);
                 });
 
-                Some(make_message(
+                Some(Message::new(
                     msg.dest,
                     msg.src,
                     MessageBody {
@@ -97,7 +89,7 @@ impl GrowCounterNode {
                 let current_local_counter = self.counters.get_mut(&self.node_id).unwrap();
                 *current_local_counter += *delta;
 
-                Some(make_message(
+                Some(Message::new(
                     msg.dest,
                     msg.src,
                     MessageBody {
@@ -107,7 +99,7 @@ impl GrowCounterNode {
                     },
                 ))
             }
-            MessageFields::Read => Some(make_message(
+            MessageFields::Read => Some(Message::new(
                 msg.dest,
                 msg.src,
                 MessageBody {
@@ -127,11 +119,13 @@ impl GrowCounterNode {
                 None
             }
             _ => None,
-        } {
-            send_message(&mut *pipe, msg)?;
+        };
+
+        if let Some(reply) = reply {
+            out.push(reply);
         }
 
-        Ok(())
+        out
     }
 }
 
@@ -143,5 +137,5 @@ fn main() -> anyhow::Result<()> {
         nodes: Vec::new(),
         last_gossip_ts: std::time::Instant::now(),
     };
-    run(|stdout, msg| state_machine.build_response(stdout, msg))
+    run(|stdout, msg| send_messages(stdout, state_machine.respond(msg)))
 }
