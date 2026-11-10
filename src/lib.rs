@@ -20,24 +20,38 @@ pub struct Message<T> {
     pub body: MessageBody<T>,
 }
 
-pub fn make_message<T>(src: String, dest: String, body: MessageBody<T>) -> Message<T> {
-    Message { src, dest, body }
+impl<T> Message<T> {
+    pub fn new(src: String, dest: String, body: MessageBody<T>) -> Self {
+        Message { src, dest, body }
+    }
 }
 
-pub fn send_message<T: Serialize>(
-    pipe: &mut impl std::io::Write,
-    msg: Message<T>,
-) -> anyhow::Result<()> {
-    serde_json::to_writer(&mut *pipe, &msg).context("Failed to serialize response to stdout")?;
+pub fn send_message<T, W>(pipe: &mut W, msg: Message<T>) -> anyhow::Result<()>
+where
+    T: Serialize,
+    W: std::io::Write,
+{
+    serde_json::to_writer(&mut *pipe, &msg).context("Failed to serialize message to stdout")?;
     pipe.write_all(b"\n").context("Failed to write newline")?;
     Ok(())
 }
 
-pub fn run<T>(
-    mut handle: impl FnMut(&mut std::io::StdoutLock<'static>, Message<T>) -> anyhow::Result<()>,
-) -> anyhow::Result<()>
+pub fn send_messages<T, W, M>(pipe: &mut W, msgs: M) -> anyhow::Result<()>
+where
+    T: Serialize,
+    W: std::io::Write,
+    M: IntoIterator<Item = Message<T>>,
+{
+    for msg in msgs {
+        send_message(pipe, msg)?;
+    }
+    Ok(())
+}
+
+pub fn run<T, F>(mut handle: F) -> anyhow::Result<()>
 where
     T: DeserializeOwned,
+    F: FnMut(&mut std::io::StdoutLock<'static>, Message<T>) -> anyhow::Result<()>,
 {
     let stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
